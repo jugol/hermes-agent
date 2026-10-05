@@ -523,6 +523,7 @@ import { remoteSessionCookies } from './remote-session-cookies'
 import {
   attachRemoteRequestHeaderListener,
   collectRemoteHeaderSources,
+  createGatewayRendererPredicate,
   createRegistryGatewayWsUrlHandler,
   createRemoteWsHeaderStore,
   oauthLoginLoadUrlOptions,
@@ -2215,6 +2216,7 @@ let connectionRegistryCache = null
 let connectionRegistryCacheMtime = null
 const remoteHeaderSessions = new WeakSet<object>()
 const remoteWsHeaderStore = createRemoteWsHeaderStore()
+const gatewayRendererWebContents = new WeakSet<object>()
 const previewWatchers = new Map()
 let previewShortcutActive = false
 const f12ShortcutActiveWindows = new Set<number>()
@@ -8872,7 +8874,14 @@ function installRemoteHeaderRulesOnSession(sess) {
   }
 
   remoteHeaderSessions.add(sess)
-  attachRemoteRequestHeaderListener(sess, headersForRemoteRequest)
+  attachRemoteRequestHeaderListener(sess, headersForRemoteRequest, {
+    isGatewayUrl: remoteWsHeaderStore.hasUrl,
+    isAppRenderer: createGatewayRendererPredicate({
+      rendererBaseUrl,
+      ownedWebContents: gatewayRendererWebContents,
+      webContentsFromId: id => electronWebContents.fromId(id)
+    })
+  })
 }
 
 function installRemoteHeaderRules() {
@@ -13674,6 +13683,8 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
 // Alt+wheel scale, so inheriting the global UI zoom would render the mascot
 // larger than its window and crop it. Chat windows keep zoom on.
 function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
+  // Only our SPA windows use this wiring; OAuth windows and webview guests do not.
+  gatewayRendererWebContents.add(win.webContents)
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
   installBrowserNavGestures(win)

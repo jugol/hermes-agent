@@ -1,6 +1,9 @@
+import type { WebContents, WebFrameMain } from 'electron'
+
 import { remoteRequestMatchesBaseUrl } from './connection-config'
 import { withEmbedRefererStamp } from './embed-referer'
 import { registryGatewayWsUrl } from './plugin-profile-routes'
+import { isRendererUrl } from './renderer-url'
 
 export interface RegistryGatewayWsConnection {
   authMode: string
@@ -18,12 +21,66 @@ interface RegistryGatewayWsUrlDependencies {
   rememberHeaders: (wsUrl: string, headers?: Record<string, string>) => void
 }
 
-interface RemoteRequestDetails {
+export interface GatewayRendererWebContents extends Pick<WebContents, 'id' | 'getType' | 'isDestroyed'> {
+  mainFrame: Pick<WebFrameMain, 'url' | 'isDestroyed' | 'detached'>
+}
+
+export interface RemoteRequestDetails {
   url: string
   requestHeaders?: Record<string, string>
+  resourceType?: string
+  frame?: GatewayRendererWebContents['mainFrame'] | null
+  webContents?: GatewayRendererWebContents
+  webContentsId?: number
 }
 
 type RemoteRequestCallback = (result: { requestHeaders?: Record<string, string> }) => void
+
+interface GatewayOriginPolicy {
+  isGatewayUrl: (url: string) => boolean
+  isAppRenderer: (details: RemoteRequestDetails) => boolean
+}
+
+export function createGatewayRendererPredicate(dependencies: {
+  rendererBaseUrl: () => string
+  ownedWebContents: WeakSet<object>
+  webContentsFromId: (id: number) => GatewayRendererWebContents | undefined
+}) {
+  return (details: RemoteRequestDetails): boolean => {
+    try {
+      const owner =
+        details.webContents ??
+        (details.webContentsId === undefined ? undefined : dependencies.webContentsFromId(details.webContentsId))
+
+      const frame = details.frame
+
+      if (
+        details.resourceType !== 'webSocket' ||
+        !owner ||
+        !dependencies.ownedWebContents.has(owner) ||
+        owner.isDestroyed() ||
+        owner.getType() !== 'window' ||
+        (details.webContentsId !== undefined && owner.id !== details.webContentsId)
+      ) {
+        return false
+      }
+
+      // Only the current top-level SPA can originate a native gateway upgrade.
+      // Matching the URL of a guest/iframe or an old document is not ownership.
+      return Boolean(
+        frame &&
+        !frame.isDestroyed() &&
+        !frame.detached &&
+        frame === owner.mainFrame &&
+        frame.url &&
+        isRendererUrl(frame.url, dependencies.rendererBaseUrl())
+      )
+    } catch {
+      // A destroyed/navigated frame is not proof of app ownership.
+      return false
+    }
+  }
+}
 
 export interface RemoteHeaderSource {
   headers?: Record<string, string>
@@ -111,14 +168,15 @@ export function oauthLoginLoadUrlOptions(headers: Record<string, string> = {}): 
 
 export function attachRemoteRequestHeaderListener(
   sessionLike: SessionLike,
-  headersForRequest: (requestUrl: string) => Record<string, string>
+  headersForRequest: (requestUrl: string) => Record<string, string>,
+  gatewayOriginPolicy?: GatewayOriginPolicy
 ) {
   // The YouTube embed Referer stamp composes onto this same listener: Electron
   // allows a single onBeforeSendHeaders listener per session, so the default
   // session (where chat embeds' iframes live) gets both behaviors here.
   sessionLike?.webRequest?.onBeforeSendHeaders?.(
     withEmbedRefererStamp((details, callback) => {
-      applyRemoteRequestHeaders(details, callback, headersForRequest)
+      applyRemoteRequestHeaders(details, callback, headersForRequest, gatewayOriginPolicy)
     })
   )
 }
@@ -127,7 +185,7 @@ export function createRemoteWsHeaderStore(limit = 100) {
   const headersByUrl = new Map<string, Record<string, string>>()
 
   const remember = (wsUrl: string, headers: Record<string, string> = {}) => {
-    if (!wsUrl || Object.keys(headers).length === 0) {
+    if (!wsUrl) {
       return
     }
 
@@ -158,23 +216,54 @@ export function createRemoteWsHeaderStore(limit = 100) {
     return headers
   }
 
-  return { headersFor, remember }
+  return { hasUrl: (url: string) => headersByUrl.has(url), headersFor, remember }
 }
 
 export function applyRemoteRequestHeaders(
   details: RemoteRequestDetails,
   callback: RemoteRequestCallback,
-  headersForRequest: (requestUrl: string) => Record<string, string>
+  headersForRequest: (requestUrl: string) => Record<string, string>,
+  gatewayOriginPolicy?: GatewayOriginPolicy
 ) {
   const headers = headersForRequest(details.url)
+  let origin: string | undefined
 
-  if (Object.keys(headers).length === 0) {
+  // The packaged SPA now has a loopback HTTP origin. A remote gateway's
+  // rebinding guard correctly rejects that origin, even with a valid ticket.
+  // Treat only main-admitted, exact gateway URLs from our own renderer as
+  // native client upgrades; never relax the server guard or stamp webviews.
+  if (gatewayOriginPolicy?.isGatewayUrl(details.url) && gatewayOriginPolicy.isAppRenderer(details)) {
+    try {
+      const target = new URL(details.url)
+
+      if (target.protocol === 'ws:' || target.protocol === 'wss:') {
+        target.protocol = target.protocol === 'wss:' ? 'https:' : 'http:'
+        origin = target.origin
+      }
+    } catch {
+      // Malformed URLs retain their original headers.
+    }
+  }
+
+  if (Object.keys(headers).length === 0 && !origin) {
     callback({})
 
     return
   }
 
-  callback({ requestHeaders: { ...details.requestHeaders, ...headers } })
+  const requestHeaders = { ...details.requestHeaders, ...headers }
+
+  if (origin) {
+    for (const name of Object.keys(requestHeaders)) {
+      if (name.toLowerCase() === 'origin') {
+        delete requestHeaders[name]
+      }
+    }
+
+    requestHeaders.Origin = origin
+  }
+
+  callback({ requestHeaders })
 }
 
 export function createRegistryGatewayWsUrlHandler(dependencies: RegistryGatewayWsUrlDependencies) {
