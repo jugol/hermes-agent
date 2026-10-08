@@ -74,6 +74,13 @@ export const SYNTHETIC_USER_ROW_PREFIXES = [
   'Cronjob Response:'
 ]
 
+/** Content is the durable marker: legacy runtime rows have no display_kind.
+ *  Keep this exact literal in step with agent/context_compressor.py. A real
+ *  user's quotation/question containing it is not scaffolding. */
+const MAX_ITERATIONS_SUMMARY_REQUEST =
+  "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response " +
+  "summarizing what you've found and accomplished so far, without calling any more tools."
+
 /** The Hermes-authored assistant row that closes a turn which failed before
  *  the model answered (a provider 401, retry exhaustion, a refusal), typed
  *  `display_kind: failed_turn` by `agent/turn_failure_copy.py`. A transcript
@@ -92,7 +99,7 @@ export function syntheticGroupUserRow(row: GroupTranscriptRow, text = groupTrans
     return true
   }
 
-  return SYNTHETIC_USER_ROW_PREFIXES.some(prefix => text.startsWith(prefix))
+  return text === MAX_ITERATIONS_SUMMARY_REQUEST || SYNTHETIC_USER_ROW_PREFIXES.some(prefix => text.startsWith(prefix))
 }
 
 /** The rows in `rows` the room engine did not write itself. A user row that

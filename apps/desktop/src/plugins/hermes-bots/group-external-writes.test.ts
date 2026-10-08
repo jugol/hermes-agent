@@ -89,6 +89,11 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+// The untyped, persisted runtime nudge from agent/context_compressor.py.
+const MAX_ITERATIONS_SUMMARY_REQUEST =
+  "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response " +
+  "summarizing what you've found and accomplished so far, without calling any more tools."
+
 describe('external writes into a member session', () => {
   it('reach the room log exactly once across two drives and a window restart', async () => {
     const gateway = createGroupGateway(options)
@@ -180,5 +185,66 @@ describe('external writes into a member session', () => {
       'status report: all green'
     ])
     expect(room.gateway.calls).toHaveLength(2)
+  })
+
+  it('does not republish a legacy budget nudge or its summary, and consumes them once', async () => {
+    const gateway = createGroupGateway(options)
+    let room = await loadRoom(gateway)
+    const thread = await drive(room, 'hello room')
+    const key = room.membership.groupSessionKey(thread, MEMBER)
+    const session = gateway.sessions.get(String(room.chat.$groupChats.get().Room.sessions?.[key]))!
+
+    session.messages.push(
+      { role: 'user', content: MAX_ITERATIONS_SUMMARY_REQUEST },
+      {
+        role: 'assistant',
+        content: 'old budget summary: report not published'
+      },
+      { role: 'user', content: 'cli question' },
+      { role: 'assistant', content: 'cli answer' }
+    )
+    // A newer same-profile oneshot is NOT this room's session. Recency is
+    // neither a delivery instruction nor consent to share its private words.
+    gateway.sessions.set('private-oneshot', {
+      ...session,
+      stored: 'private-oneshot',
+      title: 'private report repair',
+      messages: [
+        { role: 'user', content: 'private oneshot question' },
+        { role: 'assistant', content: 'private oneshot result' }
+      ]
+    })
+
+    await drive(room, 'second', thread)
+    expect(texts(room)).toEqual(['hello room', 'room reply 1', 'second', 'cli question', 'cli answer', 'room reply 2'])
+    expect(room.chat.$groupChats.get().Room.externalCursors?.[key]).toBe(6)
+
+    room = await loadRoom(gateway)
+    hydrateFromStorage(room)
+    await drive(room, 'third', thread)
+    expect(texts(room)).toEqual([
+      'hello room',
+      'room reply 1',
+      'second',
+      'cli question',
+      'cli answer',
+      'room reply 2',
+      'third',
+      'room reply 3'
+    ])
+  })
+
+  it('preserves genuine user questions quoting the budget warning and their answers', async () => {
+    const gateway = createGroupGateway(options)
+    const room = await loadRoom(gateway)
+    const thread = await drive(room, 'hello room')
+    const key = room.membership.groupSessionKey(thread, MEMBER)
+    const session = gateway.sessions.get(String(room.chat.$groupChats.get().Room.sessions?.[key]))!
+    const question = `${MAX_ITERATIONS_SUMMARY_REQUEST}\n이 경고가 왜 다시 나왔나요?`
+    const answer = 'the warning was historical, not a new limit event'
+
+    session.messages.push({ role: 'user', content: question }, { role: 'assistant', content: answer })
+    await drive(room, 'second', thread)
+    expect(texts(room)).toEqual(['hello room', 'room reply 1', 'second', question, answer, 'room reply 2'])
   })
 })
