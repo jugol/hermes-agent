@@ -291,8 +291,14 @@ function target(user, host) {
 }
 
 function buildExecArgs(conn, remoteCommand, connectTimeoutMs?) {
+  // Large inline probes can fill the macOS mux socket before fd transfer
+  // (mm_send_fd: Message too long). Keep the master for forwards/small execs.
+  const largeMuxCommand = Boolean(conn.controlPath) && Buffer.byteLength(String(remoteCommand), 'utf8') > 4096
+  const transport = largeMuxCommand ? ['-o', 'ControlMaster=no', '-o', 'ControlPath=none'] : []
+
   return [
-    ...baseSshOptions(conn.controlPath, connectTimeoutMs),
+    ...transport,
+    ...baseSshOptions(largeMuxCommand ? '' : conn.controlPath, connectTimeoutMs),
     ...hostArgs(conn),
     '--',
     target(conn.user, conn.host),
