@@ -187,6 +187,30 @@ test('buildExecArgs ends with host then the remote command', () => {
   assert.ok(args.includes('BatchMode=yes'))
 })
 
+test('buildExecArgs sends long update probes without mux and preserves the exact target and payload', () => {
+  const conn = { user: 'me', host: 'box', port: 2222, keyPath: '/k', controlPath: '/tmp/x.sock' }
+  const command = 'python3 -c ' + 'x'.repeat(8192)
+  const args = buildExecArgs(conn, command, 15000)
+  assert.ok(args.includes('ControlMaster=no'))
+  assert.ok(args.includes('ControlPath=none'))
+  assert.ok(!args.includes('ControlPath=/tmp/x.sock'))
+  assert.ok(args.includes('BatchMode=yes'))
+  assert.ok(args.includes('StrictHostKeyChecking=accept-new'))
+  assert.ok(args.includes('ConnectTimeout=15'))
+  assert.deepEqual(args.slice(-7), ['-p', '2222', '-i', '/k', '--', 'me@box', command])
+  assert.equal(conn.controlPath, '/tmp/x.sock', 'existing forwards and master ownership are untouched')
+})
+
+test('buildExecArgs keeps the mux byte boundary and existing no-mux connections unchanged', () => {
+  const conn = { user: 'me', host: 'box', port: 22, keyPath: '', controlPath: '/tmp/x.sock' }
+  assert.ok(buildExecArgs(conn, 'x'.repeat(4096)).includes('ControlPath=/tmp/x.sock'))
+  assert.ok(buildExecArgs(conn, 'x'.repeat(4097)).includes('ControlPath=none'))
+  assert.ok(buildExecArgs(conn, '한'.repeat(2000)).includes('ControlMaster=no'))
+  const noMux = buildExecArgs({ ...conn, controlPath: '' }, 'x'.repeat(8192))
+  assert.ok(!noMux.some(value => value.startsWith('ControlMaster=')))
+  assert.ok(!noMux.some(value => value.startsWith('ControlPath=')))
+})
+
 test('buildControlArgs places -O <op> first and never appends a remote command', () => {
   const conn = { user: 'me', host: 'box', port: 2222, keyPath: '/k', controlPath: '/tmp/x.sock' }
   const args = buildControlArgs(conn, 'forward', ['-L', forwardSpec(5000, 6000)], 15000)
