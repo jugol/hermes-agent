@@ -178,6 +178,37 @@ describe('session resolution', () => {
     expect(room.gateway.sessions.size).toBe(1)
   })
 
+  it.each(['not_found', 'permission_denied', 'profile_mismatch', 'invalid_params', undefined])(
+    'only a typed canonical not_found allows a fresh member session (reason=%s)', async reason => {
+      const room = await loadRoom()
+      const request = host.request as (method: string, params: Record<string, unknown>, ...options: unknown[]) => Promise<unknown>
+
+      host.request = async (method: string, params: Record<string, unknown>, ...options: unknown[]) => {
+        try { return await request(method, params, ...options) } catch (error: any) {
+          if (method !== 'session.resume' || error?.code !== 4007) {throw error}
+          throw Object.assign(new Error(reason || 'session not found'), { code: 4001, ...(reason ? { data: { reason } } : {}) })
+        }
+      }
+
+      const member: GroupMember = { name: 'research', title: '' }
+      const original = { roomId: 'preserved-room', members: [member], log: [{ at: 1, from: { kind: 'user' as const, name: 'user' }, text: 'Preserved room entry' }], watermarks: {} }
+      room.chat.$groupChats.set({ Retained: original })
+      const call = room.turns.ensureGroupChatSession('Retained', member, 'new-thread')
+
+      if (reason === 'not_found') {
+        await expect(call).resolves.toMatchObject({ fresh: true })
+        expect(room.gateway.rpcFor('session.create')).toHaveLength(1)
+      } else {
+        await expect(call).rejects.toThrow('not starting a new one')
+        expect(room.gateway.rpcFor('session.create')).toHaveLength(0)
+      }
+
+      expect(room.chat.$groupChats.get().Retained.log).toEqual(original.log)
+      expect(room.chat.$groupChats.get().Retained.members).toEqual(original.members)
+      expect(room.gateway.rpcFor('prompt.submit')).toHaveLength(0)
+    }
+  )
+
   it('falls through a genuine 4007 to the title lookup, then creates', async () => {
     const room = await loadRoom()
 

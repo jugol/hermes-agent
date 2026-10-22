@@ -309,13 +309,14 @@ export async function ensureGroupChatSession(
     //
     // FAIL CLOSED on a transient lookup failure — mirrors the sibling fix in
     // findExistingCanonicalChat (87b645f52c). session.resume signals "this
-    // target genuinely doesn't exist" with JSON-RPC code 4007; every other
+    // target genuinely doesn't exist" with legacy code 4007 or the canonical
+    // owner's typed 4001/not_found refusal; every other
     // failure (network blip, the backend still warming up after a restart,
     // an oversized-resume refusal) means the real session might still be
     // there and must not be read as "no session, mint a new one" — that
     // forks the member's real history, and the fork silently overwrites
     // room.sessions[key] so the old session becomes unreachable from the
-    // room. Only a genuine 4007 on EVERY target means there truly is
+    // room. Only a genuine not-found refusal on EVERY target means there truly is
     // nothing to resume yet, so the loop falls through to session.create.
     //
     // Target order: this thread's own pointer, then — only while the room is
@@ -376,13 +377,13 @@ export async function ensureGroupChatSession(
           }
         }
       } catch (error: any) {
-        if (error?.code !== 4007) {
+        if (error?.code !== 4007 && !(error?.code === 4001 && error?.data?.reason === 'not_found')) {
           const detail = error instanceof Error && error.message ? ` (${error.message})` : ''
           throw new Error(
             `Could not check ${member?.name || 'member'}'s group session${detail} — not starting a new one`
           )
         }
-        /* genuinely doesn't exist (4007) — try the next target / fall through to create */
+        /* genuinely doesn't exist — try the next target / fall through to create */
       }
     }
 

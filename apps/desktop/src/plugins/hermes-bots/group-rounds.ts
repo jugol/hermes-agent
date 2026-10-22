@@ -5,6 +5,7 @@
  */
 import { host } from '@hermes/plugin-sdk'
 
+import type { CanonicalGroupOrigin } from './canonical-group-registry'
 import { botFriendlyNames, botHandle, botMentionTag, mentionNameForms } from './data'
 import { groupFailureReason, recordGroupActivity } from './group-activity'
 import {
@@ -643,8 +644,8 @@ async function harvestGroupRoundMembers(context: GroupRoundMemberContext): Promi
  *  epoch and discards queued continuations.
  *  Watermarks are per thread+member (`${thread}::${memberKey}`), so parallel
  *  topics never eat each other's deltas. */
-export async function runGroupChatRounds(group: string, members: GroupMember[], thread: string, failedMembers = new Set<string>()) {
-  if (group.startsWith('canonical:')) {throw new Error('Canonical rooms are driven by the gateway')}
+export async function runGroupChatRounds(group: string, members: GroupMember[], thread: string, failedMembers = new Set<string>(), origin: CanonicalGroupOrigin = 'name') {
+  assertDesktopGroup(group, origin)
 
   const binding = followGroupChat(group, name => {
     group = name
@@ -868,6 +869,16 @@ async function harvestStrandedUntilSettled(group: string, members: GroupMember[]
   }
 }
 
+function assertDesktopGroup(group: string, origin: CanonicalGroupOrigin): void {
+  const saved = $groupChats.get()[group]
+
+  // Names are free text, including canonical-shaped names. Only a positively
+  // stored Desktop room may override that shape; an explicit key never may.
+  if (origin === 'key' || (group.startsWith('canonical:') && (!saved || saved.tombstone))) {
+    throw new Error('Canonical rooms are driven by the gateway')
+  }
+}
+
 /** User send into a group room. `thread` continues that thread (its reply
  *  box); omitted/null mints a NEW thread — the main composer's Slack shape.
  *  Appends and queues the target thread behind the active room drive,
@@ -878,9 +889,10 @@ export function sendToGroupChat(
   members: GroupMember[],
   text: string,
   thread?: null | string,
-  images?: Attachment[]
+  images?: Attachment[],
+  origin: CanonicalGroupOrigin = 'name'
 ): null | string {
-  if (group.startsWith('canonical:')) {throw new Error('Canonical rooms are driven by the gateway')}
+  assertDesktopGroup(group, origin)
   const trimmed = String(text || '').trim()
 
   if (rejectGroupSlashCommand(trimmed)) {
