@@ -146,6 +146,7 @@ test('failed answers recover an authoritative pending card once and callbacks ca
   expect(shown).toHaveLength(2)
   expect(wire.mock.calls.filter(([method]) => method === 'approval.respond')).toHaveLength(1)
   const old = shown[1]
+  client.close()
   await client.connect('ws://localhost/api/ws?native_dial=fixture&ticket=second')
   await client.request('session.resume', { session_id: 's', profile: 'sibling' })
   const before = wire.mock.calls.length

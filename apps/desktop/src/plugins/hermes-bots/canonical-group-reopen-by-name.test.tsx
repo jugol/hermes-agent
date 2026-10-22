@@ -4,12 +4,13 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import type { WritableAtom } from 'nanostores'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
-import { $canonicalGroupBindings } from './canonical-group-registry'
+import { $canonicalGroupBindings, publishCanonicalGroup } from './canonical-group-registry'
 import { $botMeta } from './data'
 import { $groupChats, $groupChatWorkspace } from './group-chat'
 import type * as GroupChatParts from './group-chat-parts'
 import { GroupChatWorkspace } from './group-chat-view'
 import { translateBots } from './i18n-test-helper'
+import type { GroupChat, GroupMember } from './types'
 
 // #140805: after a Desktop restart the in-memory room_id-keyed bindings are
 // empty, so opening a group by NAME (roster row, restored tab) used to reach
@@ -17,6 +18,7 @@ import { translateBots } from './i18n-test-helper'
 const { request, notify, openWorkspace, catalog } = vi.hoisted(() => ({
   request: vi.fn(), notify: vi.fn(), openWorkspace: vi.fn(), catalog: { patch: null as null | ((t: Record<string, unknown>) => unknown) }
 }))
+
 vi.mock('@hermes/plugin-sdk', async importOriginal => {
   const sdk = await importOriginal<typeof HermesSdk>()
   const { en } = await import('@/i18n/en')
@@ -92,6 +94,95 @@ function gateway(list: (params: Record<string, unknown>) => unknown) {
 
 const methods = () => request.mock.calls.map(call => call[1])
 
+it.each([1, 2, 4])('reopens a saved Desktop room with %i connection owners without replacing its history or identity', async count => {
+  const seated: GroupMember[] = Array.from({ length: count }, (_, index) => ({
+    name: 'default', connectionId: index === 0 ? 'local' : `remote-${index}`,
+    remoteSource: true, sourceScoped: true
+  }))
+
+  const room: GroupChat = {
+    roomId: 'desktop-original', members: seated, watermarks: { 'old-thread::local::default': 1 },
+    sessions: { 'thread:old-thread::local::default': 'stored-original' },
+    sessionOwners: { 'thread:old-thread::local::default': seated[0] },
+    log: [{ id: 'kept-entry', at: 1, from: { kind: 'user', name: 'You' }, text: 'Preserved Desktop conversation', thread: 'old-thread' }]
+  }
+
+  $groupChats.set({ Team: room })
+  // An unrelated gateway room can share the display name; it is not this room.
+  gateway(() => ({ rooms: [original], next_offset: null }))
+  await act(async () => { render(<GroupChatWorkspace group="Team" members={seated} />) })
+
+  expect(screen.getByText('Preserved Desktop conversation')).toBeTruthy()
+  expect(screen.getByRole('textbox')).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Start gateway group' })).toBeNull()
+  expect(methods()).not.toContain('groups.create')
+  expect(methods()).not.toContain('groups.state')
+  expect(methods()).not.toContain('groups.list')
+  expect(methods()).not.toContain('prompt.submit')
+  expect($groupChats.get().Team).toEqual(room)
+})
+
+it('keeps saved Desktop history ahead of a cached same-name canonical alias', async () => {
+  const seated: GroupMember[] = [roster[0], { name: 'beta', connectionId: 'remote', remoteSource: true, sourceScoped: true }]
+
+  const room: GroupChat = {
+    roomId: 'desktop-original', members: seated, watermarks: {},
+    log: [{ id: 'kept-entry', at: 1, from: { kind: 'user', name: 'You' }, text: 'Saved Desktop history', thread: 'old-thread' }]
+  }
+
+  $groupChats.set({ Team: room })
+  const route = { connectionId: 'local', profile: 'default' }
+  publishCanonicalGroup(route, 'Team', { authority: route, room: original }, 'name')
+  const bindings = $canonicalGroupBindings.get()
+  gateway(() => ({ rooms: [original], next_offset: null }))
+
+  await act(async () => { render(<GroupChatWorkspace group="Team" members={seated} />) })
+
+  expect(screen.getByText('Saved Desktop history')).toBeTruthy()
+  expect(screen.getByRole('textbox')).toBeTruthy()
+  expect(methods()).toEqual(['groups.capabilities'])
+  expect($groupChats.get().Team).toEqual(room)
+  expect($canonicalGroupBindings.get()).toEqual(bindings)
+})
+
+it('retains Desktop identity when the last foreign member leaves', async () => {
+  const seated: GroupMember[] = [...roster, { name: 'remote', connectionId: 'remote', remoteSource: true, sourceScoped: true }]
+
+  const room: GroupChat = {
+    roomId: 'desktop-original', members: seated, watermarks: { 'old-thread::local::alpha': 1 },
+    sessions: { 'thread:old-thread::local::alpha': 'stored-original' },
+    sessionOwners: { 'thread:old-thread::local::alpha': seated[0] },
+    log: [{ id: 'kept-entry', at: 1, from: { kind: 'user', name: 'You' }, text: 'History before membership change', thread: 'old-thread' }]
+  }
+
+  $groupChats.set({ Team: room })
+  gateway(() => ({ rooms: [original], next_offset: null }))
+  const view = await act(async () => render(<GroupChatWorkspace group="Team" members={seated} />))
+  const composer = screen.getByRole('textbox')
+  fireEvent.change(composer, { target: { value: 'Keep this draft through membership change' } })
+
+  await act(async () => {
+    $groupChats.set({ Team: { ...room, members: roster } })
+    view.rerender(<GroupChatWorkspace group="Team" members={roster} />)
+  })
+
+  expect(methods()).toEqual(['groups.capabilities'])
+  expect(screen.getByRole('textbox')).toBe(composer)
+  expect((composer as HTMLTextAreaElement).value).toBe('Keep this draft through membership change')
+  expect(screen.getByText('History before membership change')).toBeTruthy()
+  expect($groupChats.get().Team).toEqual({ ...room, members: roster })
+  expect($canonicalGroupBindings.get()).toEqual({})
+})
+
+it.each(['constructor', 'toString'])('does not mistake an inherited property named %s for a saved Desktop room', async group => {
+  gateway(() => ({ rooms: [], next_offset: null }))
+  await act(async () => { render(<GroupChatWorkspace group={group} members={roster} />) })
+  expect(screen.queryByRole('textbox')).toBeNull()
+  expect((screen.getByRole('button', { name: 'Start gateway group' }) as HTMLButtonElement).disabled).toBe(false)
+  expect(methods()).toContain('groups.list')
+  expect(Object.hasOwn($groupChats.get(), group)).toBe(false)
+})
+
 it('adopts the existing gateway room by name instead of minting a fork', async () => {
   gateway(() => ({ rooms: [{ room_id: 'other', name: 'Elsewhere', members }, original], next_offset: null }))
   await act(async () => { render(<GroupChatWorkspace group="Team" members={roster} />) })
@@ -106,6 +197,35 @@ it('adopts a restored canonical tab key whose binding was lost with the restart'
   await act(async () => { render(<GroupChatWorkspace group="canonical:local:default:room-original" members={[]} origin="key" />) })
   expect(methods()).not.toContain('groups.create')
   expect(request.mock.calls.find(call => call[1] === 'groups.state')?.[2]).toMatchObject({ room_id: 'room-original' })
+})
+
+it('keeps an explicit canonical key on its authority despite a colliding stored Desktop name', async () => {
+  const key = 'canonical:local:default:room-original'
+
+  const room: GroupChat = {
+    roomId: 'desktop-collision', members: roster, watermarks: {},
+    log: [{ id: 'desktop-only', at: 1, from: { kind: 'user', name: 'You' }, text: 'Not canonical history', thread: 'old-thread' }]
+  }
+
+  $groupChats.set({ [key]: room })
+  state.connectionId.set('remote')
+  gateway(() => ({ rooms: [original], next_offset: null }))
+  await act(async () => { render(<GroupChatWorkspace group={key} members={roster} origin="key" />) })
+  expect(screen.queryByText('Not canonical history')).toBeNull()
+  expect(request.mock.calls.filter(call => call[1] === 'groups.state').map(call => [call[0]?.connectionId, call[2]?.room_id]))
+    .toEqual([['local', 'room-original']])
+  expect(methods()).not.toContain('prompt.submit')
+  expect(methods()).not.toContain('groups.create')
+  expect($groupChats.get()[key]).toEqual(room)
+})
+
+it('does not treat a tombstoned Desktop record as retained room ownership', async () => {
+  $groupChats.set({ Team: { roomId: 'retired-desktop', tombstone: true, members: roster, watermarks: {}, log: [] } })
+  gateway(() => ({ rooms: [original], next_offset: null }))
+  await act(async () => { render(<GroupChatWorkspace group="Team" members={roster} />) })
+  expect(request.mock.calls.find(call => call[1] === 'groups.state')?.[2]).toMatchObject({ room_id: 'room-original' })
+  expect($groupChats.get().Team.roomId).toBe('retired-desktop')
+  expect(methods()).not.toContain('groups.create')
 })
 
 it('fails closed with a retry when the room lookup fails: retry, never mint', async () => {

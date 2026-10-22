@@ -42,6 +42,8 @@ export const GATEWAY_NOT_CONNECTED_MESSAGE = 'Hermes gateway is not connected'
 // knows server→client REQUESTS (#110521), so each prompt event is delivered to
 // the same `onRequest` registry as a request whose `respond` issues the RPC.
 const CANONICAL_PROMPT_EVENTS: Record<string, 'approval' | 'clarify'> = { 'approval.request': 'approval', 'clarify.request': 'clarify' }
+const CANONICAL_EVENT_QUEUE_MAX = 256
+const CANONICAL_EVENT_CALLBACK_MAX = 1024
 
 const ATTACH_REQUIRED = new Set([
   'prompt.submit',
@@ -105,12 +107,16 @@ export class HermesGateway extends JsonRpcGatewayClient {
   private readonly deliveredPrompts = new Map<string, { sessionId: string; profile: string }>()
   private readonly sessionProfiles = new Map<string, Set<string>>()
   private readonly profileAliases = new Map<string, string>()
-  private readonly replayProfiles = new Map<string, { sessionId: string; profile: string }>()
+  private readonly replayProfiles = new Map<string, { sessionId: string; profile: string; generation: number }>()
   private readonly displayProfiles = new Map<string, string>()
-  private readonly eventRoutes = new WeakMap<GatewayEvent, string>()
+  private readonly eventRoutes = new WeakMap<GatewayEvent, { profile: string; generation: number }>()
   private readonly reconciledEpochs = new Set<string>()
-  // Frames of an ambiguous (session, epoch) parked until its owner probes settle.
-  private readonly parkedFrames = new Map<string, Array<() => void>>()
+  // Null retires an overflowing batch as a whole, never only one listener's delivery.
+  private readonly parkedFrames = new Map<string, Array<() => void> | null>()
+  // A title lookup has no stored ID until its ACK; its early frames cannot borrow a default owner.
+  private pendingTitleResumes = 0
+  private titleResumeFailed = false
+  private readonly titleResumeFrames = new Set<string>()
   private connectionGeneration = 0
 
   override onRequest(handler: ServerRequestHandler): () => void {
@@ -194,6 +200,9 @@ export class HermesGateway extends JsonRpcGatewayClient {
     this.displayProfiles.clear()
     this.reconciledEpochs.clear()
     this.parkedFrames.clear()
+    this.pendingTitleResumes = 0
+    this.titleResumeFailed = false
+    this.titleResumeFrames.clear()
     this.attached.clear()
     super.close()
   }
@@ -220,23 +229,47 @@ export class HermesGateway extends JsonRpcGatewayClient {
 
   private deliverNormalized(event: GatewayEvent, handler: (event: GatewayEvent) => void): void {
     const key = JSON.stringify([event.session_id, event.replay_epoch])
+    const generation = this.connectionGeneration
     // While an owner probe for this (session, epoch) runs, its frames wait and deliver in order.
-    const parked = this.canonical && event.session_id ? this.parkedFrames.get(key) : undefined
+    const parked = this.canonical && event.session_id && this.parkedFrames.has(key)
 
     const deliver = () => {
+      if (generation !== this.connectionGeneration) { return }
+
       if (!this.canonical || this.normalizeCanonicalEvent(event)) { handler(event) }
     }
 
     if (parked) {
-      parked.push(deliver)
+      this.parkCanonicalDelivery(key, deliver)
     } else if (!this.canonical || this.normalizeCanonicalEvent(event)) {
       handler(event)
     } else {
       // The owner probe this frame just started may establish its route; it is the first frame parked.
-      this.parkedFrames.get(key)?.push(deliver)
+      this.parkCanonicalDelivery(key, deliver)
     }
   }
 
+  private ensureCanonicalQueue(key: string): boolean {
+    if (this.parkedFrames.has(key)) { return true }
+
+    if (this.parkedFrames.size >= CANONICAL_EVENT_QUEUE_MAX) { return false }
+
+    this.parkedFrames.set(key, [])
+
+    return true
+  }
+
+  private parkCanonicalDelivery(key: string, deliver: () => void): void {
+    const frames = this.parkedFrames.get(key)
+
+    if (!frames) { return }
+
+    if (frames.length >= CANONICAL_EVENT_CALLBACK_MAX) {
+      this.parkedFrames.set(key, null)
+    } else {
+      frames.push(deliver)
+    }
+  }
 
   private rememberSessionProfile(sessionId: string, profile: unknown): void {
     const profiles = this.sessionProfiles.get(sessionId) ?? new Set<string>()
@@ -274,23 +307,52 @@ export class HermesGateway extends JsonRpcGatewayClient {
     return profile === previous ? params : { ...params, profile }
   }
 
+  // SessionEvents owns the epoch (including cache-eviction rotation), not the request or
+  // number of mounted profiles. Only an authority reply binds that epoch to an owner here.
+  private canonicalEventOwner(sessionId: string, epoch?: string | null, queued = false, generation = this.connectionGeneration): string | undefined {
+    if (generation !== this.connectionGeneration) { return undefined }
+
+    if (typeof epoch === 'string') {
+      const owner = this.replayProfiles.get(epoch)
+
+      return owner?.sessionId === sessionId && owner.generation === generation ? owner.profile : undefined
+    }
+
+    if (this.pendingTitleResumes || (queued && this.titleResumeFailed
+        && this.titleResumeFrames.has(JSON.stringify([sessionId, epoch])))) { return undefined }
+
+    const profiles = this.sessionProfiles.get(sessionId)
+    const profile = profiles?.size === 1 ? profiles.values().next().value : undefined
+
+    // Keep the older epoch-less wire's unambiguous route. A parked title frame needs
+    // a successful attachment, never the implicit default or a merely pending request.
+    if (profile !== undefined && (!queued || this.attached.has(canonicalSessionKey(sessionId, profile)))) { return profile }
+
+    return !queued && !profiles?.size ? 'default' : undefined
+  }
+
   private normalizeCanonicalEvent(event: GatewayEvent): boolean {
     if (!event.session_id) { return true }
-    const owner = event.replay_epoch ? this.replayProfiles.get(event.replay_epoch) : undefined
-    const profiles = this.sessionProfiles.get(event.session_id)
+    const route = this.eventRoutes.get(event)
 
-    let profile = owner?.sessionId === event.session_id ? owner.profile : this.eventRoutes.get(event) ??
-      (profiles?.size === 1 ? profiles.values().next().value : profiles?.size ? undefined : 'default')
+    if (route && route.generation !== this.connectionGeneration) { return false }
+    let profile = route?.profile ?? this.canonicalEventOwner(event.session_id, event.replay_epoch)
 
     if (profile === undefined) {
-      this.reconcileAmbiguousEvent(event.session_id, event.replay_epoch)
+      if (this.pendingTitleResumes) {
+        const key = JSON.stringify([event.session_id, event.replay_epoch])
+
+        if (this.ensureCanonicalQueue(key)) { this.titleResumeFrames.add(key) }
+      } else if (this.sessionProfiles.get(event.session_id)?.size) {
+        this.reconcileAmbiguousEvent(event.session_id, event.replay_epoch)
+      }
 
       return false
     }
 
     profile = this.resolveSessionProfile(event.session_id, profile)
     // The renderer already understands an owner profile tag on shared-socket events.
-    this.eventRoutes.set(event, profile)
+    this.eventRoutes.set(event, { profile, generation: this.connectionGeneration })
     event.profile = this.displayProfiles.get(canonicalSessionKey(event.session_id, profile)) ?? profile
     recordCanonicalOwner(event, event.profile)
     this.protocol.event({ ...event, profile })
@@ -298,12 +360,49 @@ export class HermesGateway extends JsonRpcGatewayClient {
     return true
   }
 
+  private flushTitleResumeFrames(): void {
+    const generation = this.connectionGeneration
+
+    for (const key of this.titleResumeFrames) {
+      const [sid, epoch] = JSON.parse(key) as [string, string | null]
+      const owner = this.canonicalEventOwner(sid, epoch, true, generation)
+
+      if (owner === undefined && this.pendingTitleResumes) { continue }
+
+      if (owner === undefined && epoch !== null && this.sessionProfiles.get(sid)?.size && !this.reconciledEpochs.has(key)) {
+        // The queue changes custodian, not eligibility. Probe ACKs cannot release it early.
+        this.titleResumeFrames.delete(key)
+        this.reconcileAmbiguousEvent(sid, epoch)
+      } else {
+        this.releaseCanonicalFrames(key, generation)
+      }
+    }
+  }
+
+  private releaseCanonicalFrames(key: string, generation: number): void {
+    if (generation !== this.connectionGeneration) { return }
+    const parked = this.parkedFrames.get(key) ?? []
+    const [sid, epoch] = JSON.parse(key) as [string, string | null]
+    const owner = this.canonicalEventOwner(sid, epoch, true, generation)
+    this.parkedFrames.delete(key)
+    this.titleResumeFrames.delete(key)
+
+    // One release point for both title lookups and all-settled owner probes. An orphan
+    // is discarded after that bounded attempt; later attachments cannot resurrect it.
+    if (owner === undefined) { return }
+
+    for (const deliver of parked) {
+      if (generation !== this.connectionGeneration) { return }
+      deliver()
+    }
+  }
+
   private reconcileAmbiguousEvent(sessionId: string, epoch?: string): void {
     const key = JSON.stringify([sessionId, epoch])
 
-    if (this.reconciledEpochs.has(key)) { return }
+    if (this.reconciledEpochs.has(key) || !this.ensureCanonicalQueue(key)) { return }
+
     this.reconciledEpochs.add(key)
-    this.parkedFrames.set(key, [])
     const generation = this.connectionGeneration
 
     // A new/unknown replay epoch cannot choose between equal stored IDs. One
@@ -313,31 +412,18 @@ export class HermesGateway extends JsonRpcGatewayClient {
 
     void Promise.allSettled(probes).then(results => {
       if (generation !== this.connectionGeneration) { return }
-      const parked = this.parkedFrames.get(key) ?? []
-      this.parkedFrames.delete(key)
 
       // No owner answered: a later frame probes again instead of being dropped until reconnect.
       if (!results.some(result => result.status === 'fulfilled')) {
         this.reconciledEpochs.delete(key)
-
-        return
       }
 
-      for (const deliver of parked) { deliver() }
+      this.releaseCanonicalFrames(key, generation)
     })
   }
 
   override async connect(wsUrl: string): Promise<void> {
-    this.connectionGeneration++
     this.canonical = new URL(wsUrl).searchParams.has('native_dial')
-    this.attached.clear()
-    this.deliveredPrompts.clear()
-    this.sessionProfiles.clear()
-    this.profileAliases.clear()
-    this.retainReplayOwners()
-    this.displayProfiles.clear()
-    this.reconciledEpochs.clear()
-    this.parkedFrames.clear()
 
     return super.connect(wsUrl)
   }
@@ -422,6 +508,13 @@ export class HermesGateway extends JsonRpcGatewayClient {
 
     let prepared = this.protocol.prepare(method, params)
     const wireMethod = this.protocol.wire(method, prepared)
+    const titleResume = wireMethod === 'session.resume' && typeof prepared.title === 'string' && prepared.session_id === undefined
+    let titleResumeSucceeded = false
+
+    if (titleResume) {
+      if (!this.pendingTitleResumes) { this.titleResumeFailed = false }
+      this.pendingTitleResumes++
+    }
 
     try {
       let result: T
@@ -443,6 +536,19 @@ export class HermesGateway extends JsonRpcGatewayClient {
         prepared = this.snapshotRoute(prepared, result)
       }
 
+      if (method === 'session.events.since') {
+        const replay = result as { replay_epoch?: string; snapshot_required?: boolean }
+
+        // A retained cursor can route the redial's replay RPC, but only its successful
+        // same-epoch authority reply renews event-delivery proof for this generation.
+        if (typeof prepared.session_id === 'string' && typeof replay.replay_epoch === 'string'
+            && replay.replay_epoch === prepared.replay_epoch && !replay.snapshot_required) {
+          this.replayProfiles.set(replay.replay_epoch, {
+            sessionId: prepared.session_id, profile: canonicalProfile(prepared.profile), generation
+          })
+        }
+      }
+
       // A settle follow-up (compress -> resume) inherits the caller's deadline and cancellation.
       const followUp = (m: string, p: Record<string, unknown>) => {
         this.requireConnectionGeneration(generation)
@@ -457,10 +563,20 @@ export class HermesGateway extends JsonRpcGatewayClient {
         this.adoptAttachedSnapshot(settled as { session_id?: string; prompts?: Array<Record<string, unknown>> }, prepared.profile)
       }
 
+      titleResumeSucceeded = true
+
       return settled
     } catch (error) {
       this.protocol.failure(prepared, error)
       throw error
+    } finally {
+      if (titleResume && generation === this.connectionGeneration) {
+        // A failed lookup has no stored ID. It cannot rule its profile out of any
+        // epoch-less batch in this overlapping wave, even when another attach succeeds.
+        this.titleResumeFailed ||= !titleResumeSucceeded
+        this.pendingTitleResumes--
+        this.flushTitleResumeFrames()
+      }
     }
   }
 
@@ -502,13 +618,15 @@ export class HermesGateway extends JsonRpcGatewayClient {
       }
 
       if (typeof settled.replay_epoch === 'string') {
-        this.replayProfiles.set(settled.replay_epoch, { sessionId: sid, profile: canonicalProfile(profile) })
+        this.replayProfiles.set(settled.replay_epoch, { sessionId: sid, profile: canonicalProfile(profile), generation: this.connectionGeneration })
       }
     }
 
     for (const prompt of (settled.prompts ?? [])) {
       this.deliverCanonicalPrompt({ type: `${prompt.kind}.request`, session_id: sid, profile: canonicalProfile(profile), payload: prompt }, true)
     }
+
+    this.flushTitleResumeFrames()
   }
 
   constructor() {
@@ -536,11 +654,28 @@ export class HermesGateway extends JsonRpcGatewayClient {
         return new WebSocket(parsed.toString(), [CANONICAL_GATEWAY_PROTOCOL, `hermes-gateway-ticket.${ticket}`])
       }
     })
+    this.onState(state => {
+      if (state !== 'connecting') { return }
+      // The shared client emits this only for a new transport, before socketFactory.
+      // Idempotent OPEN/CONNECTING calls must retain this transport's owner proofs.
+      this.connectionGeneration++
+      this.attached.clear()
+      this.deliveredPrompts.clear()
+      this.sessionProfiles.clear()
+      this.profileAliases.clear()
+      this.retainReplayOwners()
+      this.displayProfiles.clear()
+      this.reconciledEpochs.clear()
+      this.parkedFrames.clear()
+      this.pendingTitleResumes = 0
+      this.titleResumeFailed = false
+      this.titleResumeFrames.clear()
+    })
     this.onEvent(event => {
       if (!this.canonical) { return }
 
       if (event.type in CANONICAL_PROMPT_EVENTS) {
-        this.deliverCanonicalPrompt({ ...event, profile: this.eventRoutes.get(event) }, false)
+        this.deliverCanonicalPrompt({ ...event, profile: this.eventRoutes.get(event)?.profile }, false)
       } else if (event.type.endsWith('.settled')) {
         const id = (event.payload as { prompt_id?: unknown } | undefined)?.prompt_id
 

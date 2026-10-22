@@ -24,10 +24,23 @@ const CASES: Array<[string, Record<string, unknown>, Record<string, unknown> | R
   ['composer effort', { ...BASE, cwd: '/w', cwd_explicit: false, reasoning_effort: 'high', fast: false }, { profile: 'default', cwd: '/w', reasoning: 'high', service_tier: 'normal' }],
   ['onboarding minimal effort', { ...BASE, reasoning_effort: 'minimal', fast: false, title: 'Welcome' }, { profile: 'default', reasoning: 'minimal', title: 'Welcome', service_tier: 'normal' }],
   ['Bot Chat', { ...BASE, title: 'Bot Chat', hidden: true, follow_profile_config: true }, { profile: 'default', follow_profile_config: true, hidden: true }],
+  ['legacy group member', { profile: 'ops', title: 'Group: room-id · thread-id', hidden: true, room_plumbing: true, follow_profile_config: true }, { profile: 'ops', title: 'Group: room-id · thread-id', follow_profile_config: true, hidden: true }],
   ['Fast speed', { ...BASE, cwd: '/w', cwd_explicit: false, fast: true }, { profile: 'default', cwd: '/w', service_tier: 'priority' }],
   ['Ultrafast speed', { ...BASE, fast: true, service_tier: 'ultrafast' }, { profile: 'default', service_tier: 'ultrafast' }],
   // KoNit-K P1: a manual model pick ships its provider; the owner's create contract admits both.
-  ['manual model + provider', { ...BASE, model: 'gpt-5', provider: 'openrouter', fast: false }, { profile: 'default', model: 'gpt-5', provider: 'openrouter', service_tier: 'normal' }]
+  ['manual model + provider', { ...BASE, model: 'gpt-5', provider: 'openrouter', fast: false }, { profile: 'default', model: 'gpt-5', provider: 'openrouter', service_tier: 'normal' }],
+  ...[
+    ['model', { model: 'picked' }], ['provider', { provider: 'custom:private' }],
+    ['toolsets', { toolsets: ['terminal'] }], ['reasoning', { reasoning: 'high' }],
+    ['reasoning_effort', { reasoning_effort: 'high' }], ['fast', { fast: false }],
+    ['service_tier', { service_tier: 'priority' }], ['not following', { follow_profile_config: false }],
+    ['visible', { hidden: false }], ['not a room title', { title: 'Notes' }],
+    ['non-boolean marker', { room_plumbing: 'true' }]
+  ].map(([label, overrides]) => [
+    `unrepresentable room option: ${label}`,
+    { profile: 'ops', title: 'Group: room-id · thread-id', hidden: true, room_plumbing: true, follow_profile_config: true, ...(overrides as Record<string, unknown>) },
+    /explicit session options: room_plumbing/
+  ] as [string, Record<string, unknown>, RegExp])
 ]
 
 test.each(CASES)('%s: the Desktop create frame is admitted by the owner contract or refused by name', async (_label, params, expected) => {

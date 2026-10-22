@@ -5,7 +5,7 @@ import type { WritableAtom } from 'nanostores'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { CANONICAL_GROUP_LOCALES } from './canonical-group-locales'
-import { $canonicalGroupBindings } from './canonical-group-registry'
+import { $canonicalGroupBindings, publishCanonicalGroup } from './canonical-group-registry'
 import { CreateGroupChatDialog } from './create-dialog'
 import { $botMeta } from './data'
 import { $groupChats, $groupChatWorkspace, updateGroupChat } from './group-chat'
@@ -185,6 +185,32 @@ it.each(refused)('classifies %j as unavailable on both surfaces: no legacy rende
   expect(updateGroupChat).not.toHaveBeenCalled()
   expect($groupChats.get()).toEqual({})
   expect(request.mock.calls.map(call => call[1])).toEqual(['groups.capabilities', 'groups.capabilities'])
+})
+
+it.each(refused)('does not turn a saved cross-connection room into an execution fallback for %j', async value => {
+  const members = [roster[0], mixedRoster[2]]
+  $groupChats.set({ Existing: { roomId: 'kept-room', members, log: [], watermarks: {} } })
+  const route = { connectionId: 'local', profile: 'default' }
+  publishCanonicalGroup(route, 'Existing', { authority: route, room: { room_id: 'unrelated', name: 'Existing', members: [] } }, 'name')
+  answer(value)
+  await act(async () => { render(<GroupChatWorkspace group="Existing" members={members} />) })
+  expect(screen.getByText(unavailable)).toBeTruthy()
+  expect(screen.queryByRole('textbox')).toBeNull()
+  expect(request.mock.calls.map(call => call[1])).toEqual(['groups.capabilities'])
+  expect($groupChats.get().Existing.roomId).toBe('kept-room')
+})
+
+it('never executes an explicit canonical key as a Desktop room on a legacy driver', async () => {
+  const key = 'canonical:local:default:not-a-key'
+  const members = [roster[0], mixedRoster[2]]
+  const room = { roomId: 'desktop-collision', members, log: [], watermarks: {} }
+  $groupChats.set({ [key]: room })
+  answer(legacy)
+  await act(async () => { render(<GroupChatWorkspace group={key} members={members} origin="key" />) })
+  expect(screen.queryByRole('textbox')).toBeNull()
+  expect(screen.getByText(unavailable)).toBeTruthy()
+  expect(request.mock.calls.map(call => call[1])).toEqual(['groups.capabilities'])
+  expect($groupChats.get()[key]).toEqual(room)
 })
 
 it('keeps positive classifications working: legacy renders and creates locally, canonical creates a gateway room', async () => {

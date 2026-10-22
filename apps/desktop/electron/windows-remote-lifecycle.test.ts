@@ -134,13 +134,13 @@ function sshWith(exec) {
 type SshExecOptions = { stdinData?: string | Buffer }
 
 function scriptFromInvocation(command: string, options: SshExecOptions = {}) {
-  const encoded = command.match(/-EncodedCommand\s+([^\s]+)$/)?.[1]
+  // A short encoded bootstrap can read the actual probe from stdin.
+  const encoded =
+    options.stdinData == null
+      ? command.match(/-EncodedCommand\s+([^\s]+)$/)?.[1] || ''
+      : String(options.stdinData).trim()
 
-  if (encoded) {
-    return Buffer.from(encoded, 'base64').toString('utf16le')
-  }
-
-  return Buffer.from(String(options.stdinData || '').trim(), 'base64').toString('utf16le')
+  return Buffer.from(encoded, 'base64').toString('utf16le')
 }
 
 test('PowerShell transport uses UTF-16LE encoded commands and literal escaping', () => {
@@ -482,8 +482,13 @@ test('Windows platform probe streams long PowerShell scripts over stdin', async 
   })
 
   assert.equal(result.os, 'Windows')
-  assert.match(command, /-Command \[ScriptBlock\]::Create/)
-  assert.doesNotMatch(command, /-EncodedCommand/)
+  // The login shell must not parse the reader as a native command argument:
+  // PowerShell otherwise invokes .Invoke() on a String before the child runs.
+  const bootstrap = scriptFromInvocation(command)
+  assert.match(command, /-EncodedCommand [A-Za-z0-9+/=]+$/)
+  assert.match(bootstrap, /\[ScriptBlock\]::Create\(/)
+  assert.match(bootstrap, /FromBase64String\(\[Console\]::In.ReadToEnd\(\)\)/)
+  assert.doesNotMatch(bootstrap, /Assert-NoReparse/)
   assert.ok(command.length < 1024)
   assert.match(stdinData, /^[A-Za-z0-9+/=\r\n]+$/)
   const decodedScript = Buffer.from(stdinData.trim(), 'base64').toString('utf16le')
@@ -562,9 +567,12 @@ test('every Windows probe command fits the cmd.exe 8191-char limit (#106716)', a
   }
 })
 
-function runLocalWindowsCommand(command, stdinData) {
+function runLocalWindowsCommand(command, stdinData, shell = 'cmd.exe', env = process.env) {
   return new Promise((resolve, reject) => {
-    const child = spawn('cmd.exe', ['/d', '/s', '/c', command], { windowsHide: true })
+    const args =
+      shell === 'cmd.exe' ? ['/d', '/s', '/c', command] : ['-NoProfile', '-NonInteractive', '-Command', command]
+
+    const child = spawn(shell, args, { windowsHide: true, env })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
 
@@ -587,26 +595,57 @@ function runLocalWindowsCommand(command, stdinData) {
   })
 }
 
-test.skipIf(process.platform !== 'win32')('Windows platform probe executes in real PowerShell', async () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-probe-'))
-  const hermesPath = path.join(tempDir, 'hermes.exe')
+test.skipIf(process.platform !== 'win32').each(['cmd.exe', 'powershell.exe'])(
+  'Windows platform probe executes through the real %s OpenSSH login shell',
+  async shell => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-probe-'))
+    const hermesPath = path.join(tempDir, 'hermes.exe')
+
+    try {
+      fs.writeFileSync(hermesPath, '')
+      fs.writeFileSync(path.join(tempDir, 'python.exe'), '')
+
+      const result = await probeWindowsRemote(
+        {
+          exec: (command: string, options: SshExecOptions = {}) =>
+            runLocalWindowsCommand(command, options.stdinData, shell)
+        },
+        hermesPath
+      )
+
+      assert.equal(result.os, 'Windows')
+      assert.equal(result.hermesPath, hermesPath)
+      assert.equal(result.python, path.join(tempDir, 'python.exe'))
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  }
+)
+
+test.skipIf(process.platform !== 'win32')('automatic discovery skips a launcher without its sibling Python, but an explicit broken launcher fails closed', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-probe-discovery-'))
+  const bin = path.join(root, 'bin')
+  const scripts = path.join(root, 'hermes-agent', 'venv', 'Scripts')
+  const shim = path.join(bin, 'hermes.exe')
+  const executable = path.join(scripts, 'hermes.exe')
 
   try {
-    fs.writeFileSync(hermesPath, '')
-    fs.writeFileSync(path.join(tempDir, 'python.exe'), '')
+    fs.mkdirSync(bin, { recursive: true })
+    fs.mkdirSync(scripts, { recursive: true })
 
-    const result = await probeWindowsRemote(
-      {
-        exec: (command: string, options: SshExecOptions = {}) => runLocalWindowsCommand(command, options.stdinData)
-      },
-      hermesPath
-    )
+    for (const file of [shim, executable, path.join(scripts, 'python.exe')]) {fs.writeFileSync(file, '')}
 
-    assert.equal(result.os, 'Windows')
-    assert.equal(result.hermesPath, hermesPath)
-    assert.equal(result.python, path.join(tempDir, 'python.exe'))
+    const env = { ...process.env, HERMES_HOME: root, PATH: bin + path.delimiter + process.env.PATH }
+
+    const ssh = sshWith((command, options: SshExecOptions = {}) =>
+      runLocalWindowsCommand(command, options.stdinData, 'powershell.exe', env))
+
+    const discovered = await probeWindowsRemote(ssh)
+    assert.equal(discovered.hermesPath, executable)
+    assert.equal(discovered.python, path.join(scripts, 'python.exe'))
+    await assert.rejects(probeWindowsRemote(ssh, shim), /Path was not found/)
   } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true })
+    fs.rmSync(root, { recursive: true, force: true })
   }
 })
 
@@ -633,7 +672,7 @@ test('platform detection preserves POSIX and falls back to Windows PowerShell', 
   )
 
   assert.equal(result.os, 'Windows')
-  assert.match(calls[1], /-Command \[ScriptBlock\]::Create/)
+  assert.match(calls[1], /-EncodedCommand [A-Za-z0-9+/=]+$/)
 })
 
 test('platform detection surfaces transport failures as themselves, not unsupported-platform', async () => {

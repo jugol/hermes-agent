@@ -387,12 +387,22 @@ export class CanonicalDesktopProtocol {
       return { session_id: params.session_id, source: 'desktop', ...(params.profile ? { profile: params.profile } : {}) }
     }
 
-    // N93: a watch window's legacy `lazy` attach is not in the owner's resume contract (the owner
-    // holds the agent; nothing to defer). It skipped the REST prefetch, so it takes the transcript.
-    if (method === 'session.resume' && 'lazy' in params) {
-      const { lazy: _lazy, ...resume } = params
+    if (method === 'session.resume') {
+      const resume = { ...params }
 
-      return { ...resume, omit_messages: false }
+      // N93: a watch window's legacy lazy attach skipped the REST prefetch;
+      // the owner already holds the agent, so take its transcript on attach.
+      if ('lazy' in resume) { delete resume.lazy; resume.omit_messages = false }
+
+      // The retained group producer uses session_id for both stored IDs and its
+      // Group: title lookup. Canonical IDs stay IDs; only that legacy title form
+      // uses the owner's title resolver, with its existing authorization checks.
+      if (typeof resume.session_id === 'string' && resume.session_id.startsWith('Group: ') && !('title' in resume)) {
+        resume.title = resume.session_id
+        delete resume.session_id
+      }
+
+      return resume
     }
 
     if (method === 'session.interrupt' || method === 'session.redirect' || method === 'session.steer') {
@@ -509,6 +519,15 @@ export class CanonicalDesktopProtocol {
     if (typeof effort === 'string' && effort) { params.reasoning = effort }
 
     if (tier) { params.service_tier = tier }
+
+    // Legacy group members never pick a session runtime: room_plumbing discarded stored
+    // model/provider/reasoning/tier pins on resume. The owner's profile-following policy
+    // represents that unpinned producer, but keeps explicit picks, so never translate those.
+    if (params.room_plumbing === true && params.follow_profile_config === true && params.hidden === true
+        && typeof params.title === 'string' && params.title.startsWith('Group: ')
+        && !['model', 'provider', 'toolsets', 'reasoning', 'reasoning_effort', 'fast', 'service_tier'].some(key => key in input)) {
+      delete params.room_plumbing
+    }
 
     if (typeof params.cwd_explicit !== 'boolean') { delete params.cwd_explicit }
 
@@ -737,7 +756,9 @@ export class CanonicalDesktopProtocol {
       id: prompt.prompt_id, method: prompt.kind, params: canonicalPromptParams(prompt.kind, sid, prompt)
     }))
 
-    return { ...value, open_requests, pending_approval: prompts.find((p: any) => p.kind === 'approval'), pending_clarify: prompts.find((p: any) => p.kind === 'clarify'), info: { ...value.info, stored_session_id: value.stored_session_id, pending_submissions: value.pending_submissions, replay_epoch: value.replay_epoch, last_sequence: value.last_sequence, execution_generation: value.execution_generation, running: value.running } }
+    // The legacy group resume consumer calls the durable ID session_key; never
+    // substitute its title lookup or a runtime ID when the owner supplies the ID.
+    return { ...value, session_key: value.stored_session_id, open_requests, pending_approval: prompts.find((p: any) => p.kind === 'approval'), pending_clarify: prompts.find((p: any) => p.kind === 'clarify'), info: { ...value.info, stored_session_id: value.stored_session_id, pending_submissions: value.pending_submissions, replay_epoch: value.replay_epoch, last_sequence: value.last_sequence, execution_generation: value.execution_generation, running: value.running } }
   }
 
   // The canonical compress receipt carries counts, not the retained transcript;

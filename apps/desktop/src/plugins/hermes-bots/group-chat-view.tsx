@@ -589,7 +589,11 @@ export function GroupChatWorkspace(props: GroupChatWorkspaceProps) {
   const bindings = useValue($canonicalGroupBindings)
   const connectionId = useValue(host.state.connectionId)
   const profile = useValue(host.state.profile)
-  const binding = canonicalGroupBindingFor(bindings, { connectionId: connectionId ?? '', profile }, props.group, props.origin ?? 'name')
+  const rooms = useValue($groupChats)
+  const saved = Object.hasOwn(rooms, props.group) ? rooms[props.group] : undefined
+  // A discovered alias is not the identity of a positively stored Desktop room.
+  const keepDesktopRoom = props.origin !== 'key' && saved && !saved.tombstone
+  const binding = keepDesktopRoom ? undefined : canonicalGroupBindingFor(bindings, { connectionId: connectionId ?? '', profile }, props.group, props.origin ?? 'name')
 
   if (binding) {return <CanonicalGroupWorkspace binding={binding} onBack={props.onBack} visible={props.visible} />}
 
@@ -604,6 +608,13 @@ function GroupExecutionGate(props: GroupChatWorkspaceProps) {
   const gateway = useValue(host.state.gateway)
   const activationEpoch = gatewayActivationEpoch()
   const source = JSON.stringify([connectionId, profile, gateway, activationEpoch])
+  const rooms = useValue($groupChats)
+  const saved = Object.hasOwn(rooms, props.group) ? rooms[props.group] : undefined
+
+  // Stored identity survives membership edits; canonical rooms live only in
+  // the binding registry, never in this Desktop transcript store.
+  const keepDesktopRoom = Boolean(saved && !saved.tombstone && props.origin !== 'key')
+
   const [capability, setCapability] = useState<{ source: string; mode: GroupExecutionMode } | null>(null)
   const mode = capability?.source === source ? capability.mode : 'checking'
   const [error, setError] = useState('')
@@ -614,7 +625,7 @@ function GroupExecutionGate(props: GroupChatWorkspaceProps) {
   const [lookupAttempt, setLookupAttempt] = useState(0)
   const lookupStatus = lookup?.source === source ? lookup.status : 'pending'
   useEffect(() => {
-    if (mode !== 'canonical') {return}
+    if (mode !== 'canonical' || keepDesktopRoom) {return}
     let cancelled = false
     setLookup({ source, status: 'pending' })
     setError('')
@@ -634,7 +645,7 @@ function GroupExecutionGate(props: GroupChatWorkspaceProps) {
       })
 
     return () => { cancelled = true }
-  }, [mode, source, props.group, props.origin, lookupAttempt, connectionId, profile])
+  }, [mode, source, props.group, props.origin, lookupAttempt, connectionId, profile, keepDesktopRoom])
   useEffect(() => {
     let cancelled = false
     setCapability(null)
@@ -658,13 +669,15 @@ function GroupExecutionGate(props: GroupChatWorkspaceProps) {
     return () => { cancelled = true }
   }, [connectionId, profile, gateway, source])
 
-  if (mode === 'legacy') {return <LegacyGroupChatWorkspace {...props} />}
+  if ((mode === 'legacy' && props.origin !== 'key') || (mode === 'canonical' && keepDesktopRoom)) {
+    return <LegacyGroupChatWorkspace {...props} />
+  }
 
   // A `canonical:` key names an existing room; it never seeds a new one.
   const canCreate = mode === 'canonical' && lookupStatus === 'missing' && canonicalGroupKeyRoute(props.group, props.origin ?? 'name') === null
 
   const message = mode !== 'canonical'
-    ? mode === 'unavailable' ? b.canonical.driverUnavailable : 'Checking group driver…'
+    ? mode === 'checking' ? 'Checking group driver…' : b.canonical.driverUnavailable
     : lookupStatus === 'pending' ? t.gatewayGroupOpen.opening
       : lookupStatus === 'failed' ? t.gatewayGroupOpen.lookupFailed
         : canCreate ? 'This is a legacy Desktop room. Start a gateway-owned group with these members; the old history stays here and is not replayed.'
@@ -697,7 +710,7 @@ function GroupExecutionGate(props: GroupChatWorkspaceProps) {
   </div>
 }
 
-function LegacyGroupChatWorkspace({ group, members, onBack, visible = true }: GroupChatWorkspaceProps) {
+function LegacyGroupChatWorkspace({ group, members, onBack, visible = true, origin = 'name' }: GroupChatWorkspaceProps) {
   const b = useBots()
   const rooms: Record<string, GroupChatRoom> = useValue($groupChats)
   const allMeta: Record<string, BotMeta> = useValue($botMeta)
@@ -1209,13 +1222,17 @@ function LegacyGroupChatWorkspace({ group, members, onBack, visible = true }: Gr
     // Main composer = START A NEW THREAD with the whole group (Slack shape).
     // Full descriptors ride into the turn loop: remote members keep their
     // connection fields so their turns route to their own machines.
-    const minted = sendToGroupChat(group, memberDescriptors(), text, null, images)
+    let minted: null | string = null
 
-    if (!minted) {
-      const restored = restoreGroupComposerDraft(composerKeyRef.current, cleared.revision, before)
+    try {
+      minted = sendToGroupChat(group, memberDescriptors(), text, null, images, origin)
+    } finally {
+      if (!minted) {
+        const restored = restoreGroupComposerDraft(composerKeyRef.current, cleared.revision, before)
 
-      if (restored) {
-        setComposerDraft(restored)
+        if (restored) {
+          setComposerDraft(restored)
+        }
       }
     }
   }
@@ -1244,13 +1261,17 @@ function LegacyGroupChatWorkspace({ group, members, onBack, visible = true }: Gr
 
     // Reply box = CONTINUE this thread; the member turns it triggers are
     // scoped to it.
-    const sent = sendToGroupChat(group, memberDescriptors(), text, thread, images)
+    let sent: null | string = null
 
-    if (!sent) {
-      const restored = restoreGroupComposerDraft(composerKeyRef.current, cleared.revision, before)
+    try {
+      sent = sendToGroupChat(group, memberDescriptors(), text, thread, images, origin)
+    } finally {
+      if (!sent) {
+        const restored = restoreGroupComposerDraft(composerKeyRef.current, cleared.revision, before)
 
-      if (restored) {
-        setComposerDraft(restored)
+        if (restored) {
+          setComposerDraft(restored)
+        }
       }
     }
   }
